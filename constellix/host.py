@@ -54,6 +54,7 @@ import ipaddress
 import sys
 import argparse
 import traceback
+import re
 
 import util
 import dns
@@ -399,7 +400,17 @@ def main():
     logging.info('Getting details for domain %s.', args.domain)
     
     domain = dns.Domain(args.domain,verbosity=_verbose)
+    domain.deafult_ttl = DEFAULT_TTL
     domain.get_known_ptr()
+    if args.ipv4: 
+        ips = re.split(r',\s*|;\s*|\s+', args.ipv4)
+        print(domain.add_update("A", ips))
+    if args.ipv6:
+        ips = re.split(r',\s*|;\s*|\s+', args.ipv6)
+        print(domain.add_update("AAAA", ips))
+    domain.sync_ptr()
+    domain.sync()
+    logging.info(domain.records)
 
     finish_timestamp = datetime.datetime.now()
     elapsed_time = finish_timestamp - start_timestamp

@@ -28,6 +28,8 @@ _DEFAULT_VERSION = "v1"
 _DEFAULT_SERVICE = "domains"
 _DEFAULT_TRIES = 8
 
+_CACHE_GET = {}
+
 class Error(Exception):
     """Base class for exceptions in this module."""
     pass
@@ -44,13 +46,13 @@ class ConstellixAPIError(Error):
         attempt (int): The number of attempts to send this payload
     """
 
-    def __init__(self, url, status, message, trace = None, token = None, attempt = None):
+    def __init__(self, url, status, message, trace = None, token = None, failures = None):
         self.url = url
         self.status = url
         self.message = message
         if trace: self.trace = trace
         if token: self.token = token
-        if attempt: self.attempt = attempt
+        if failures: self.failures = failures
 
 class ConstellixAuthentication():
     """Holds authentication information for the API
@@ -115,12 +117,14 @@ class api():
         
         return f'{self.__auth.key}:{hmacdata}:{epoch}'
 
-    def _send(self, endpoint, data = {}, method = "GET"):
+    def _send(self, endpoint, data = {}, method = "GET", use_get_cache = True):
         url = self.url + '/' + str(endpoint)
         method = method.upper()
         payload = {}
+        failures = []
 
         direction = "from"
+        cache = False
 
         if method == "POST" and data:
             payload = data
@@ -132,6 +136,10 @@ class api():
             payload = data
         elif data:
             url += '?' + urllib.parse.urlencode(data)
+            if use_get_cache: cache = True
+            if use_get_cache and url in _CACHE_GET:
+                logging.info('[CACHE/%s] %s', method, url)
+                return _CACHE_GET[url]["json"]
 
         logging.info('[%s] %s', method, url)
 
@@ -143,26 +151,41 @@ class api():
                 'x-cns-security-token': token
             }
             response = requests.request(method, url, headers=headers, json = payload)
+            failures.append({
+                "attempt": attempt,
+                "trace": response.headers["X-Trace"],
+                "token": token,
+                "status": response.status_code
+            })
+
             if response.status_code == 200:
                 break
             if response.status_code == 400:
                 break
             if response.status_code == 404:
                 break
+            
             attempt += 1
             logging.debug('[%i] trace: %s', response.status_code,response.headers["X-Trace"])
             logging.debug(response.text)
 
+        if cache:
+            _CACHE_GET[url] = {
+                "status": response.status_code,
+                "json": None
+            }
+
         if 200 <= response.status_code <= 299:
+            if cache: _CACHE_GET[url]["json"] = response.json()
             return response.json()
         elif response.status_code == 404:
             return
         else:
-            raise ConstellixAPIError(url, response.status_code, f'Unable to {method} data {direction} Constellix API.', response.headers["X-Trace"], token, attempt)
+            raise ConstellixAPIError(url, response.status_code, f'Unable to {method} data {direction} Constellix API.', response.headers["X-Trace"], token, failures)
 
         return
     
-    def search(self, data = {}, domain_id = None, record_type = None):
+    def search(self, data = {}, domain_id = None, record_type = None, use_cache = True):
         uri = ''
         if domain_id: uri += str(domain_id) + '/'
         if record_type: uri += 'records/' + record_type + '/'
@@ -171,13 +194,13 @@ class api():
                 "exact": data
             }
         uri += 'search'
-        return self._send(uri, data, "GET")
+        return self._send(uri, data, "GET",use_get_cache=use_cache)
 
-    def get(self, domain_id, record_type = None, record_id = None):
+    def get(self, domain_id, record_type = None, record_id = None, use_cache = True):
         uri = str(domain_id)
         if record_type: uri += '/records/' + record_type.upper()
         if record_id: uri += '/' + str(record_id)
-        return self._send(uri)
+        return self._send(uri, use_get_cache=use_cache)
 
     def update(self, domain_id, record_type = None, record_id = None, data = {}):
         uri = str(domain_id)
@@ -194,4 +217,10 @@ class api():
         if record_type: uri += '/records/' + record_type.upper()
         if record_id: uri += '/' + str(record_id)
         return self._send(uri, {}, "DELETE")
+
+    def bulk(self, domain_id, data = None):
+        uri = str(domain_id) + '/records'
+        if not data:
+            return
+        return self._send(uri, data, "POST")
 
