@@ -4,6 +4,7 @@ import json
 import constellix
 import ipaddress
 import logging
+import re
 
 import util
 
@@ -54,11 +55,11 @@ class Domain(object):
         super().__init__()
         self.__api = constellix.api(verbosity=verbosity)
         self.__verbosity = verbosity
-        self.__changes = []
+        self.__changes = {}
         if ttl:
             self.default_ttl = ttl
         else:
-            self.deafult_ttl = 3600
+            self.default_ttl = 3600
 
         if fqdn:
             domainparts = fqdn.split('.')
@@ -97,7 +98,7 @@ class Domain(object):
 
     @property
     def pending_changes(self):
-        if self.__changes and len(self.__changes) > 0:
+        if self.__changes and len(self.__changes.__dict__.items()) > 0:
             return True
         return False
     
@@ -106,20 +107,20 @@ class Domain(object):
         raise ReadOnlyAttribbuteError("pending_changes", "Can not set pending_changes - it is read only.")
 
     @property
-    def deafult_ttl(self):
+    def default_ttl(self):
         if self.__default_ttl:
             return self.__default_ttl
         return 3600
 
-    @deafult_ttl.setter
-    def deafult_ttl(self, deafult_ttl):
-        deafult_ttl = int(deafult_ttl)
-        if deafult_ttl < 0:
+    @default_ttl.setter
+    def default_ttl(self, default_ttl):
+        default_ttl = int(default_ttl)
+        if default_ttl < 0:
             self.__default_ttl = 0
-        elif deafult_ttl >= 604800:
+        elif default_ttl >= 604800:
             self.__default_ttl = 604800
         else:
-            self.__default_ttl = deafult_ttl
+            self.__default_ttl = default_ttl
 
     @property
     def verbosity(self):
@@ -149,57 +150,204 @@ class Domain(object):
 
     def get_known_ptr(self):
         for record_type in ["A", "AAAA"]:
-            setattr(self.ptr, record_type, [])
-            records = self.get_all_records(record_type)
-            if records:
-                for record in records:
-                    if hasattr(record, "values") and len(record.values) > 0:
-                        for ip in record.values:
-                            ipaddr = ipaddress.ip_address(ip)
-                            arpa = ipaddr.reverse_pointer
-                            ptr = Domain(arpa, verbosity=self.verbosity)
-                            if ptr and hasattr(ptr, "parent_id"):
-                                ptr.get_all_records("PTR")
-                                ptr_records = getattr(self.ptr, record_type)
-                                ptr_records.append({str(ipaddr):ptr})
+            setattr(self.ptr, record_type, {})
+            record = self.get_all_records(record_type)
+            if not record: continue
+            if hasattr(record, "values") and len(record.values) > 0:
+                for ip in record.values:
+                    ipaddr = ipaddress.ip_address(ip)
+                    arpa = ipaddr.reverse_pointer
+                    ptr = Domain(arpa, verbosity=self.verbosity)
+                    if ptr and hasattr(ptr, "parent_id"):
+                        ptr.get_all_records("PTR")
+                        ptr_records = getattr(self.ptr, record_type)
+                        ptr_records[str(ipaddr)] = ptr
         return self.ptr
 
     def sync_ptr(self):
         if not hasattr(self, "ptr"):
             raise DomainRecordsError("PTR", "No PTR records exist. Try get_known_ptr first.")
         for record_type in ["A", "AAAA"]:
-            try:
-                records = getattr(self.ptr, record_type)
-            except AttributeError: 
+            diff = self.__ptrdiff(record_type)
+            if not diff:
                 continue
-            for record in records:
-                for ip in record:
-                    ptr = record[ip]
-                    logging.info(ptr)
+            if "to_create" in diff and diff["to_create"]:
+                for record in diff["to_create"]:
+                    if not str(record["parent_id"]) in self.__changes: self.__changes[str(record["parent_id"])] = []
+                    append = {
+                        "type": "ptr",
+                        "add": True,
+                        "set": {
+                            "name": record["name"],
+                            "ttl": self.default_ttl,
+                            "roundRobin": []
+                        }
+                    }
+                    for value in record["values"]:
+                        append["set"]["roundRobin"].append({"value":value})
+                    self.__changes[str(record["parent_id"])].append(append)
+            if "to_delete" in diff and diff["to_delete"]:
+                for record in diff["to_delete"]:
+                    if not str(record["parent_id"]) in self.__changes: self.__changes[str(record["parent_id"])] = []
+                    for value in record["values"]:
+                        delete = {
+                            "type": "ptr",
+                            "delete": True,
+                            "filter":{"field": "id", "op": "eq", "value":value},
+                            "set": {}
+                        }
+                        self.__changes[str(record["parent_id"])].append(delete)
+            if "to_update" in diff and diff["to_update"]:
+                for record in diff["to_update"]:
+                    if not str(record["parent_id"]) in self.__changes: self.__changes[str(record["parent_id"])] = []
+                    update = {
+                        "type": "ptr",
+                        "update": True,
+                        "filter":{"field": "id", "op": "eq", "value":record["id"]},
+                        "set": {
+                            "name": record["name"],
+                            "ttl": self.default_ttl,
+                            "roundRobin": []
+                        }
+                    }
+                    for value in record["values"]:
+                        update["set"]["roundRobin"].append({"value":value})
+                    self.__changes[str(record["parent_id"])].append(update)
 
-    def __diff(self, record_type, new_values = None):
-        current = getattr(self.records, record_type)
-        print(self)
-        print(current.values)
-        if not current and not new_values:
-            logging.info("No diff needed both existing and new values are empty.")
+        return self.__changes
+
+    def __ptrdiff(self, record_type):
+        source = None
+        current = None
+        if self.__changes and str(self.parent_id) in self.__changes:
+            for change in self.__changes[str(self.parent_id)]:
+                if change["type"].lower() == record_type.lower():
+                    values = []
+                    if ("update" in change and change["update"]) or ("add" in change and change["add"]):
+                        for value in change["set"]["roundRobin"]:
+                            if not value["disableFlag"]:
+                                values.append(value["value"])
+                    source = "Pending domain changes"
+                    current = Record(record_type=record_type, values=values)
+
+        if not current:
+            source = "Domain record"
+            current = getattr(self.records, record_type, None)
+
+        ptr = getattr(self.ptr, record_type, None)
+        if not current and not ptr:
+            logging.info("No %s diff needed both existing and new values are empty.", record_type)
             return None
+
         data = {
             "to_delete": [],
+            "to_update": [],
             "to_create": [],
             "exists": []
         }
+
+        fqdn = self.parent_name
+        if self.name and len(self.name)>0:
+            fqdn = f'{self.name}.{fqdn}'
+
+        if ptr:
+            for ip, domain_record in ptr.items():
+                if hasattr(domain_record.records.PTR, "id") and not hasattr(current, "values"):
+                    data["to_delete"].append({
+                        "parent_id": domain_record.parent_id,
+                        "values": [domain_record.records.PTR.id]
+                    })
+                elif hasattr(current, "values") and not ip in current.values and hasattr(domain_record.records.PTR, "id"):
+                    data["to_delete"].append({
+                        "parent_id": domain_record.parent_id,
+                        "values": [domain_record.records.PTR.id]
+                    })
+                elif hasattr(current, "values") and not ip in current.values and not hasattr(domain_record.records.PTR, "id"):
+                    data["to_create"].append({
+                        "parent_id": domain_record.parent_id,
+                        "name": domain_record.name,
+                        "values": [
+                            fqdn
+                        ]
+                    })
+
+        if current and hasattr(current, "values") and current.values:
+            for value in current.values:
+
+                ipaddr = ipaddress.ip_address(value)
+                arpa = ipaddr.reverse_pointer
+
+                ptr_record = None
+
+                if value in ptr and not hasattr(ptr[value],"id"):
+                    ptr_record = ptr[value]
+                elif not value in ptr:
+                    ptr_record = Domain(arpa, verbosity=self.verbosity)
+                    ptr_record.get_all_records("PTR")
+                else:
+                    data["exists"].append(value)
+
+                if ptr_record and hasattr(ptr_record, "parent_id"):
+                    if hasattr(ptr_record.records, "PTR") and ptr_record.records.PTR and hasattr(ptr_record.records.PTR, "id") and ptr_record.records.PTR.id:
+                        data["to_update"].append({
+                            "parent_id": ptr_record.parent_id,
+                            "id": ptr_record.records.PTR.id,
+                            "name": ptr_record.name,
+                            "values": [
+                                fqdn
+                            ]
+                        })
+                    else:
+                        data["to_create"].append({
+                            "parent_id": ptr_record.parent_id,
+                            "name": ptr_record.name,
+                            "values": [
+                                fqdn
+                            ]
+                        })
+        return data
+
+    def __diff(self, record_type, new_values = None):
+        current = getattr(self.records, record_type)
+        if not current and not new_values:
+            logging.info("No %s diff needed both existing and new values are empty.", record_type)
+            return None
+        data = {
+            "to_delete": [],
+            "to_update": [],
+            "to_create": [],
+            "exists": []
+        }
+
+        if not new_values:
+            data["to_delete"].append(current.id)
+            return data
+
+        prefect_match = True
+
         for value in new_values:
-            logging.info("Checking: %s against %s", value, str(current.values))
-            if hasattr(current, "values") and current.values and value in current.values:
-                data['exists'].append(value)
-            else:
-                data['to_create'].append(value)
+            if not (hasattr(current, "values") and current.values and value in current.values):
+                prefect_match = False
+                break
+
         if hasattr(current, "values") and current.values:
             for value in current.values:
-                logging.info("Checking already existing: %s against %s", value, str(new_values))
-                if new_values and not value in new_values:
-                    data['to_delete'].append(value)
+                if not value in new_values:
+                    prefect_match = False
+                    break
+        else:
+            prefect_match = False
+
+        if prefect_match:
+            data["exists"].append(current.id)
+        elif hasattr(current, "id") and current.id:
+            data["to_update"].append({
+                "id": current.id,
+                "values": new_values
+            })
+        else:
+            data["to_create"] = new_values
+
         return data
 
 
@@ -207,24 +355,98 @@ class Domain(object):
         if values and isinstance(values, str):
             values = [values]
         diff = self.__diff(record_type, values)
+        if not diff:
+            return self.__changes
         template = getattr(self, f'template_{record_type}')
         if "to_create" in diff and diff["to_create"]:
-            self.__changes.append({
+            if not str(self.parent_id) in self.__changes: self.__changes[str(self.parent_id)] = []
+            self.__changes[str(self.parent_id)].append({
                 "type": record_type.lower(),
                 "add": True,
                 "set": template(diff["to_create"])
             })
-        return diff
+        if "to_delete" in diff and diff["to_delete"]:
+            for id in diff["to_delete"]:
+                if not str(self.parent_id) in self.__changes: self.__changes[str(self.parent_id)] = []
+                self.__changes[str(self.parent_id)].append({
+                    "type": record_type.lower(),
+                    "delete": True,
+                    "filter":{"field": "id", "op": "eq", "value":id},
+                    "set": {}
+                })
+        if "to_update" in diff and diff["to_update"]:
+            for update in diff["to_update"]:
+                if not str(self.parent_id) in self.__changes: self.__changes[str(self.parent_id)] = []
+                self.__changes[str(self.parent_id)].append({
+                    "type": record_type.lower(),
+                    "update": True,
+                    "filter":{"field": "id", "op": "eq", "value":update["id"]},
+                    "set": template(update["values"])
+                })
+        return self.__changes
 
     def sync(self):
         if not self.__changes:
             logging.info("There are no changes to sync.")
-        if not self.parent_id:
-            raise DomainUpdateError("There is no parent id for this domain. Can not sync.")
-        logging.info("Sending changes.")
-        changes = self.__api.bulk(self.parent_id, self.__changes)
-        logging.info(changes)
-        return self
+            return {
+                "added": 0,
+                "updated": 0,
+                "deleted": 0
+            }
+
+        added = 0
+        updated = 0
+        deleted = 0
+
+        for parent_id, changes in self.__changes.items():
+            change_types = {
+                "update": 0,
+                "create": 0,
+                "delete": 0,
+            }
+
+            for change in changes:
+                if "add" in change:
+                    change_types["create"] += 1
+                elif "update" in change:
+                    change_types["update"] += 1
+                elif "delete" in change:
+                    change_types["delete"] += 1
+
+            logging.debug("Sending changes for %i: %s",int(parent_id), str(changes))
+            result = self.__api.bulk(parent_id, changes)
+            if not "success" in result:
+                raise DomainUpdateError("Unable to update domain")
+
+            this_added = 0
+            this_updated = 0
+            this_deleted = 0
+
+            update_search = re.compile(r'(?P<added>\d+) record\(s\) added|(?P<updated>\d+) record\(s\) updated|(?P<deleted>\d+) record\(s\) deleted', re.MULTILINE)
+            for l in update_search.finditer(result['success']):
+                    if(l.group("added")):
+                            this_added = int(l.group("added"))
+                    elif(l.group("updated")):
+                            this_updated = int(l.group("updated"))
+                    elif(l.group("deleted")):
+                            this_deleted = int(l.group("deleted"))
+            
+            if not this_added == change_types['create']:
+                raise DomainUpdateError(f'Failed to complete record creation {this_added}/{change_types["create"]}')
+            elif not this_updated == change_types['update']:
+                raise DomainUpdateError(f'Failed to complete record update {this_updated}/{change_types["update"]}')
+            elif not this_deleted == change_types['delete']:
+                raise DomainUpdateError(f'Failed to complete record delete {this_deleted}/{change_types["delete"]}')
+
+            added += this_added
+            updated += this_updated
+            deleted += this_deleted
+
+        return {
+            "added": added,
+            "updated": updated,
+            "deleted": deleted
+        }
 
     def template_A(self, values = None, ttl = None):
         """Template A record
@@ -232,7 +454,7 @@ class Domain(object):
         Attributes:
             values (list): The list of values to insert into the template
         """
-        if not ttl: ttl = self.__default_ttl
+        if not ttl: ttl = self.default_ttl
 
         template = {
             "name": self.name,
@@ -254,7 +476,7 @@ class Domain(object):
         Attributes:
             values (list): The list of AAAA record values to insert into the template
         """
-        if not ttl: ttl = self.__default_ttl
+        if not ttl: ttl = self.default_ttl
 
         template = {
             "name": self.name,
@@ -275,7 +497,7 @@ class Domain(object):
         Attributes:
             values (list): The list of AFSDB record values to insert into the template
         """
-        if not ttl: ttl = self.__default_ttl
+        if not ttl: ttl = self.default_ttl
 
         template = {
             "name": self.name,
@@ -296,7 +518,7 @@ class Domain(object):
         Attributes:
             values (list): The list of APL record values to insert into the template
         """
-        if not ttl: ttl = self.__default_ttl
+        if not ttl: ttl = self.default_ttl
 
         template = {
             "name": self.name,
@@ -317,7 +539,7 @@ class Domain(object):
         Attributes:
             values (list): The list of CAA record values to insert into the template
         """
-        if not ttl: ttl = self.__default_ttl
+        if not ttl: ttl = self.default_ttl
 
         template = {
             "name": self.name,
@@ -338,7 +560,7 @@ class Domain(object):
         Attributes:
             values (list): The list of CDNSKEY record values to insert into the template
         """
-        if not ttl: ttl = self.__default_ttl
+        if not ttl: ttl = self.default_ttl
 
         template = {
             "name": self.name,
@@ -359,7 +581,7 @@ class Domain(object):
         Attributes:
             values (list): The list of CDS record values to insert into the template
         """
-        if not ttl: ttl = self.__default_ttl
+        if not ttl: ttl = self.default_ttl
 
         template = {
             "name": self.name,
@@ -380,7 +602,7 @@ class Domain(object):
         Attributes:
             values (list): The list of CERT record values to insert into the template
         """
-        if not ttl: ttl = self.__default_ttl
+        if not ttl: ttl = self.default_ttl
 
         template = {
             "name": self.name,
@@ -401,7 +623,7 @@ class Domain(object):
         Attributes:
             values (list): The list of CNAME record values to insert into the template
         """
-        if not ttl: ttl = self.__default_ttl
+        if not ttl: ttl = self.default_ttl
 
         template = {
             "name": self.name,
@@ -422,7 +644,7 @@ class Domain(object):
         Attributes:
             values (list): The list of CSYNC record values to insert into the template
         """
-        if not ttl: ttl = self.__default_ttl
+        if not ttl: ttl = self.default_ttl
 
         template = {
             "name": self.name,
@@ -443,7 +665,7 @@ class Domain(object):
         Attributes:
             values (list): The list of DHCID record values to insert into the template
         """
-        if not ttl: ttl = self.__default_ttl
+        if not ttl: ttl = self.default_ttl
 
         template = {
             "name": self.name,
@@ -464,7 +686,7 @@ class Domain(object):
         Attributes:
             values (list): The list of DLV record values to insert into the template
         """
-        if not ttl: ttl = self.__default_ttl
+        if not ttl: ttl = self.default_ttl
 
         template = {
             "name": self.name,
@@ -485,7 +707,7 @@ class Domain(object):
         Attributes:
             values (list): The list of DNAME record values to insert into the template
         """
-        if not ttl: ttl = self.__default_ttl
+        if not ttl: ttl = self.default_ttl
 
         template = {
             "name": self.name,
@@ -506,7 +728,7 @@ class Domain(object):
         Attributes:
             values (list): The list of DNSKEY record values to insert into the template
         """
-        if not ttl: ttl = self.__default_ttl
+        if not ttl: ttl = self.default_ttl
 
         template = {
             "name": self.name,
@@ -527,7 +749,7 @@ class Domain(object):
         Attributes:
             values (list): The list of DS record values to insert into the template
         """
-        if not ttl: ttl = self.__default_ttl
+        if not ttl: ttl = self.default_ttl
 
         template = {
             "name": self.name,
@@ -548,7 +770,7 @@ class Domain(object):
         Attributes:
             values (list): The list of EUI record values to insert into the template
         """
-        if not ttl: ttl = self.__default_ttl
+        if not ttl: ttl = self.default_ttl
 
         template = {
             "name": self.name,
@@ -569,7 +791,7 @@ class Domain(object):
         Attributes:
             values (list): The list of HINFO record values to insert into the template
         """
-        if not ttl: ttl = self.__default_ttl
+        if not ttl: ttl = self.default_ttl
 
         template = {
             "name": self.name,
@@ -590,7 +812,7 @@ class Domain(object):
         Attributes:
             values (list): The list of HIP record values to insert into the template
         """
-        if not ttl: ttl = self.__default_ttl
+        if not ttl: ttl = self.default_ttl
 
         template = {
             "name": self.name,
@@ -611,7 +833,7 @@ class Domain(object):
         Attributes:
             values (list): The list of IPSECKEY record values to insert into the template
         """
-        if not ttl: ttl = self.__default_ttl
+        if not ttl: ttl = self.default_ttl
 
         template = {
             "name": self.name,
@@ -632,7 +854,7 @@ class Domain(object):
         Attributes:
             values (list): The list of KEY record values to insert into the template
         """
-        if not ttl: ttl = self.__default_ttl
+        if not ttl: ttl = self.default_ttl
 
         template = {
             "name": self.name,
@@ -653,7 +875,7 @@ class Domain(object):
         Attributes:
             values (list): The list of KX record values to insert into the template
         """
-        if not ttl: ttl = self.__default_ttl
+        if not ttl: ttl = self.default_ttl
 
         template = {
             "name": self.name,
@@ -674,7 +896,7 @@ class Domain(object):
         Attributes:
             values (list): The list of LOC record values to insert into the template
         """
-        if not ttl: ttl = self.__default_ttl
+        if not ttl: ttl = self.default_ttl
 
         template = {
             "name": self.name,
@@ -695,7 +917,7 @@ class Domain(object):
         Attributes:
             values (list): The list of MX record values to insert into the template
         """
-        if not ttl: ttl = self.__default_ttl
+        if not ttl: ttl = self.default_ttl
 
         template = {
             "name": self.name,
@@ -716,7 +938,7 @@ class Domain(object):
         Attributes:
             values (list): The list of NAPTR record values to insert into the template
         """
-        if not ttl: ttl = self.__default_ttl
+        if not ttl: ttl = self.default_ttl
 
         template = {
             "name": self.name,
@@ -737,7 +959,7 @@ class Domain(object):
         Attributes:
             values (list): The list of NS record values to insert into the template
         """
-        if not ttl: ttl = self.__default_ttl
+        if not ttl: ttl = self.default_ttl
 
         template = {
             "name": self.name,
@@ -758,7 +980,7 @@ class Domain(object):
         Attributes:
             values (list): The list of NSEC record values to insert into the template
         """
-        if not ttl: ttl = self.__default_ttl
+        if not ttl: ttl = self.default_ttl
 
         template = {
             "name": self.name,
@@ -779,7 +1001,7 @@ class Domain(object):
         Attributes:
             values (list): The list of OPENPGPKEY record values to insert into the template
         """
-        if not ttl: ttl = self.__default_ttl
+        if not ttl: ttl = self.default_ttl
 
         template = {
             "name": self.name,
@@ -800,7 +1022,7 @@ class Domain(object):
         Attributes:
             values (list): The list of PTR record values to insert into the template
         """
-        if not ttl: ttl = self.__default_ttl
+        if not ttl: ttl = self.default_ttl
 
         template = {
             "name": self.name,
@@ -821,7 +1043,7 @@ class Domain(object):
         Attributes:
             values (list): The list of RRSIG record values to insert into the template
         """
-        if not ttl: ttl = self.__default_ttl
+        if not ttl: ttl = self.default_ttl
 
         template = {
             "name": self.name,
@@ -842,7 +1064,7 @@ class Domain(object):
         Attributes:
             values (list): The list of RP record values to insert into the template
         """
-        if not ttl: ttl = self.__default_ttl
+        if not ttl: ttl = self.default_ttl
 
         template = {
             "name": self.name,
@@ -863,7 +1085,7 @@ class Domain(object):
         Attributes:
             values (list): The list of SIG record values to insert into the template
         """
-        if not ttl: ttl = self.__default_ttl
+        if not ttl: ttl = self.default_ttl
 
         template = {
             "name": self.name,
@@ -884,7 +1106,7 @@ class Domain(object):
         Attributes:
             values (list): The list of SMIMEA record values to insert into the template
         """
-        if not ttl: ttl = self.__default_ttl
+        if not ttl: ttl = self.default_ttl
 
         template = {
             "name": self.name,
@@ -905,7 +1127,7 @@ class Domain(object):
         Attributes:
             values (list): The list of SOA record values to insert into the template
         """
-        if not ttl: ttl = self.__default_ttl
+        if not ttl: ttl = self.default_ttl
 
         template = {
             "name": self.name,
@@ -926,7 +1148,7 @@ class Domain(object):
         Attributes:
             values (list): The list of SRV record values to insert into the template
         """
-        if not ttl: ttl = self.__default_ttl
+        if not ttl: ttl = self.default_ttl
 
         template = {
             "name": self.name,
@@ -947,7 +1169,7 @@ class Domain(object):
         Attributes:
             values (list): The list of SSHFP record values to insert into the template
         """
-        if not ttl: ttl = self.__default_ttl
+        if not ttl: ttl = self.default_ttl
 
         template = {
             "name": self.name,
@@ -968,7 +1190,7 @@ class Domain(object):
         Attributes:
             values (list): The list of TA record values to insert into the template
         """
-        if not ttl: ttl = self.__default_ttl
+        if not ttl: ttl = self.default_ttl
 
         template = {
             "name": self.name,
@@ -989,7 +1211,7 @@ class Domain(object):
         Attributes:
             values (list): The list of TKEY record values to insert into the template
         """
-        if not ttl: ttl = self.__default_ttl
+        if not ttl: ttl = self.default_ttl
 
         template = {
             "name": self.name,
@@ -1010,7 +1232,7 @@ class Domain(object):
         Attributes:
             values (list): The list of TLSA record values to insert into the template
         """
-        if not ttl: ttl = self.__default_ttl
+        if not ttl: ttl = self.default_ttl
 
         template = {
             "name": self.name,
@@ -1031,7 +1253,7 @@ class Domain(object):
         Attributes:
             values (list): The list of TSIG record values to insert into the template
         """
-        if not ttl: ttl = self.__default_ttl
+        if not ttl: ttl = self.default_ttl
 
         template = {
             "name": self.name,
@@ -1052,7 +1274,7 @@ class Domain(object):
         Attributes:
             values (list): The list of TXT record values to insert into the template
         """
-        if not ttl: ttl = self.__default_ttl
+        if not ttl: ttl = self.default_ttl
 
         template = {
             "name": self.name,
@@ -1073,7 +1295,7 @@ class Domain(object):
         Attributes:
             values (list): The list of URI record values to insert into the template
         """
-        if not ttl: ttl = self.__default_ttl
+        if not ttl: ttl = self.default_ttl
 
         template = {
             "name": self.name,
@@ -1094,7 +1316,7 @@ class Domain(object):
         Attributes:
             values (list): The list of ZONEMD record values to insert into the template
         """
-        if not ttl: ttl = self.__default_ttl
+        if not ttl: ttl = self.default_ttl
 
         template = {
             "name": self.name,
@@ -1114,8 +1336,8 @@ class Domain_PTR(object):
 
     def __init__(self):
         super().__init__()
-        self.A = []
-        self.AAAA = []
+        self.A = {}
+        self.AAAA = {}
 
     def __str__(self):
         return str(self.__dict__)
@@ -1167,19 +1389,6 @@ class Record(object):
 
     def __str__(self):
         return str(self.__dict__)
-
-
-class RecordHolder(object):
-    """Record Holder"""
-
-    def __init__(self):
-        super().__init__()
-
-    def __str__(self):
-        data = {}
-        for name in self.__dict__:
-            data[name] = str(getattr(self, name))
-        return str(data)
 
 class Records(object):
     """Domain records"""
@@ -1235,9 +1444,7 @@ class Records(object):
     def A(self):
         data = []
         try:
-            items = self.__A.__dict__.items()
-            for name, record in items:
-                data.append(record)
+            data = self.__A
         except AttributeError:
             pass
         return data
@@ -1245,13 +1452,10 @@ class Records(object):
     @A.setter
     def A(self, A):
         if isinstance(A, Record):
-            if not hasattr(self, "__A"):
-                logging.debug("Creating record holder for A")
-                self.__A = RecordHolder()
-            if not hasattr(A, "name"):
-                raise DomainRecordsError(A,'The A domain record has no name')
-            logging.debug("Storing %s in A", A.name)
-            setattr(self.__A,A.name,A)
+            if hasattr(self, "__A"):
+                logging.debug("Overwriting current record for A")
+            logging.debug("Storing '%s' in A", A.name)
+            self.__A = A
         else:
             raise DomainRecordsError(A,'The A domain record must be of Record class')
 
@@ -1259,9 +1463,7 @@ class Records(object):
     def AAAA(self):
         data = []
         try:
-            items = self.__AAAA.__dict__.items()
-            for name, record in items:
-                data.append(record)
+            data = self.__AAAA
         except AttributeError:
             pass
         return data
@@ -1269,13 +1471,10 @@ class Records(object):
     @AAAA.setter
     def AAAA(self, AAAA):
         if isinstance(AAAA, Record):
-            if not hasattr(self, "__AAAA"):
-                logging.debug("Creating record holder for AAAA")
-                self.__AAAA = RecordHolder()
-            if not hasattr(AAAA, "name"):
-                raise DomainRecordsError(AAAA,'The AAAA domain record has no name')
-            logging.debug("Storing %s in AAAA", AAAA.name)
-            setattr(self.__AAAA,AAAA.name,AAAA)
+            if hasattr(self, "__AAAA"):
+                logging.debug("Overwriting current record for AAAA")
+            logging.debug("Storing '%s' in AAAA", AAAA.name)
+            self.__AAAA = AAAA
         else:
             raise DomainRecordsError(AAAA,'The AAAA domain record must be of Record class')
 
@@ -1283,9 +1482,7 @@ class Records(object):
     def AFSDB(self):
         data = []
         try:
-            items = self.__AFSDB.__dict__.items()
-            for name, record in items:
-                data.append(record)
+            data = self.__AFSDB
         except AttributeError:
             pass
         return data
@@ -1293,13 +1490,10 @@ class Records(object):
     @AFSDB.setter
     def AFSDB(self, AFSDB):
         if isinstance(AFSDB, Record):
-            if not hasattr(self, "__AFSDB"):
-                logging.debug("Creating record holder for AFSDB")
-                self.__AFSDB = RecordHolder()
-            if not hasattr(AFSDB, "name"):
-                raise DomainRecordsError(AFSDB,'The AFSDB domain record has no name')
-            logging.debug("Storing %s in AFSDB", AFSDB.name)
-            setattr(self.__AFSDB,AFSDB.name,AFSDB)
+            if hasattr(self, "__AFSDB"):
+                logging.debug("Overwriting current record for AFSDB")
+            logging.debug("Storing '%s' in AFSDB", AFSDB.name)
+            self.__AFSDB = AFSDB
         else:
             raise DomainRecordsError(AFSDB,'The AFSDB domain record must be of Record class')
 
@@ -1307,9 +1501,7 @@ class Records(object):
     def APL(self):
         data = []
         try:
-            items = self.__APL.__dict__.items()
-            for name, record in items:
-                data.append(record)
+            data = self.__APL
         except AttributeError:
             pass
         return data
@@ -1317,13 +1509,10 @@ class Records(object):
     @APL.setter
     def APL(self, APL):
         if isinstance(APL, Record):
-            if not hasattr(self, "__APL"):
-                logging.debug("Creating record holder for APL")
-                self.__APL = RecordHolder()
-            if not hasattr(APL, "name"):
-                raise DomainRecordsError(APL,'The APL domain record has no name')
-            logging.debug("Storing %s in APL", APL.name)
-            setattr(self.__APL,APL.name,APL)
+            if hasattr(self, "__APL"):
+                logging.debug("Overwriting current record for APL")
+            logging.debug("Storing '%s' in APL", APL.name)
+            self.__APL = APL
         else:
             raise DomainRecordsError(APL,'The APL domain record must be of Record class')
 
@@ -1331,9 +1520,7 @@ class Records(object):
     def CAA(self):
         data = []
         try:
-            items = self.__CAA.__dict__.items()
-            for name, record in items:
-                data.append(record)
+            data = self.__CAA
         except AttributeError:
             pass
         return data
@@ -1341,13 +1528,10 @@ class Records(object):
     @CAA.setter
     def CAA(self, CAA):
         if isinstance(CAA, Record):
-            if not hasattr(self, "__CAA"):
-                logging.debug("Creating record holder for CAA")
-                self.__CAA = RecordHolder()
-            if not hasattr(CAA, "name"):
-                raise DomainRecordsError(CAA,'The CAA domain record has no name')
-            logging.debug("Storing %s in CAA", CAA.name)
-            setattr(self.__CAA,CAA.name,CAA)
+            if hasattr(self, "__CAA"):
+                logging.debug("Overwriting current record for CAA")
+            logging.debug("Storing '%s' in CAA", CAA.name)
+            self.__CAA = CAA
         else:
             raise DomainRecordsError(CAA,'The CAA domain record must be of Record class')
 
@@ -1355,9 +1539,7 @@ class Records(object):
     def CDNSKEY(self):
         data = []
         try:
-            items = self.__CDNSKEY.__dict__.items()
-            for name, record in items:
-                data.append(record)
+            data = self.__CDNSKEY
         except AttributeError:
             pass
         return data
@@ -1365,13 +1547,10 @@ class Records(object):
     @CDNSKEY.setter
     def CDNSKEY(self, CDNSKEY):
         if isinstance(CDNSKEY, Record):
-            if not hasattr(self, "__CDNSKEY"):
-                logging.debug("Creating record holder for CDNSKEY")
-                self.__CDNSKEY = RecordHolder()
-            if not hasattr(CDNSKEY, "name"):
-                raise DomainRecordsError(CDNSKEY,'The CDNSKEY domain record has no name')
-            logging.debug("Storing %s in CDNSKEY", CDNSKEY.name)
-            setattr(self.__CDNSKEY,CDNSKEY.name,CDNSKEY)
+            if hasattr(self, "__CDNSKEY"):
+                logging.debug("Overwriting current record for CDNSKEY")
+            logging.debug("Storing '%s' in CDNSKEY", CDNSKEY.name)
+            self.__CDNSKEY = CDNSKEY
         else:
             raise DomainRecordsError(CDNSKEY,'The CDNSKEY domain record must be of Record class')
 
@@ -1379,9 +1558,7 @@ class Records(object):
     def CDS(self):
         data = []
         try:
-            items = self.__CDS.__dict__.items()
-            for name, record in items:
-                data.append(record)
+            data = self.__CDS
         except AttributeError:
             pass
         return data
@@ -1389,13 +1566,10 @@ class Records(object):
     @CDS.setter
     def CDS(self, CDS):
         if isinstance(CDS, Record):
-            if not hasattr(self, "__CDS"):
-                logging.debug("Creating record holder for CDS")
-                self.__CDS = RecordHolder()
-            if not hasattr(CDS, "name"):
-                raise DomainRecordsError(CDS,'The CDS domain record has no name')
-            logging.debug("Storing %s in CDS", CDS.name)
-            setattr(self.__CDS,CDS.name,CDS)
+            if hasattr(self, "__CDS"):
+                logging.debug("Overwriting current record for CDS")
+            logging.debug("Storing '%s' in CDS", CDS.name)
+            self.__CDS = CDS
         else:
             raise DomainRecordsError(CDS,'The CDS domain record must be of Record class')
 
@@ -1403,9 +1577,7 @@ class Records(object):
     def CERT(self):
         data = []
         try:
-            items = self.__CERT.__dict__.items()
-            for name, record in items:
-                data.append(record)
+            data = self.__CERT
         except AttributeError:
             pass
         return data
@@ -1413,13 +1585,10 @@ class Records(object):
     @CERT.setter
     def CERT(self, CERT):
         if isinstance(CERT, Record):
-            if not hasattr(self, "__CERT"):
-                logging.debug("Creating record holder for CERT")
-                self.__CERT = RecordHolder()
-            if not hasattr(CERT, "name"):
-                raise DomainRecordsError(CERT,'The CERT domain record has no name')
-            logging.debug("Storing %s in CERT", CERT.name)
-            setattr(self.__CERT,CERT.name,CERT)
+            if hasattr(self, "__CERT"):
+                logging.debug("Overwriting current record for CERT")
+            logging.debug("Storing '%s' in CERT", CERT.name)
+            self.__CERT = CERT
         else:
             raise DomainRecordsError(CERT,'The CERT domain record must be of Record class')
 
@@ -1427,9 +1596,7 @@ class Records(object):
     def CNAME(self):
         data = []
         try:
-            items = self.__CNAME.__dict__.items()
-            for name, record in items:
-                data.append(record)
+            data = self.__CNAME
         except AttributeError:
             pass
         return data
@@ -1437,13 +1604,10 @@ class Records(object):
     @CNAME.setter
     def CNAME(self, CNAME):
         if isinstance(CNAME, Record):
-            if not hasattr(self, "__CNAME"):
-                logging.debug("Creating record holder for CNAME")
-                self.__CNAME = RecordHolder()
-            if not hasattr(CNAME, "name"):
-                raise DomainRecordsError(CNAME,'The CNAME domain record has no name')
-            logging.debug("Storing %s in CNAME", CNAME.name)
-            setattr(self.__CNAME,CNAME.name,CNAME)
+            if hasattr(self, "__CNAME"):
+                logging.debug("Overwriting current record for CNAME")
+            logging.debug("Storing '%s' in CNAME", CNAME.name)
+            self.__CNAME = CNAME
         else:
             raise DomainRecordsError(CNAME,'The CNAME domain record must be of Record class')
 
@@ -1451,9 +1615,7 @@ class Records(object):
     def CSYNC(self):
         data = []
         try:
-            items = self.__CSYNC.__dict__.items()
-            for name, record in items:
-                data.append(record)
+            data = self.__CSYNC
         except AttributeError:
             pass
         return data
@@ -1461,13 +1623,10 @@ class Records(object):
     @CSYNC.setter
     def CSYNC(self, CSYNC):
         if isinstance(CSYNC, Record):
-            if not hasattr(self, "__CSYNC"):
-                logging.debug("Creating record holder for CSYNC")
-                self.__CSYNC = RecordHolder()
-            if not hasattr(CSYNC, "name"):
-                raise DomainRecordsError(CSYNC,'The CSYNC domain record has no name')
-            logging.debug("Storing %s in CSYNC", CSYNC.name)
-            setattr(self.__CSYNC,CSYNC.name,CSYNC)
+            if hasattr(self, "__CSYNC"):
+                logging.debug("Overwriting current record for CSYNC")
+            logging.debug("Storing '%s' in CSYNC", CSYNC.name)
+            self.__CSYNC = CSYNC
         else:
             raise DomainRecordsError(CSYNC,'The CSYNC domain record must be of Record class')
 
@@ -1475,9 +1634,7 @@ class Records(object):
     def DHCID(self):
         data = []
         try:
-            items = self.__DHCID.__dict__.items()
-            for name, record in items:
-                data.append(record)
+            data = self.__DHCID
         except AttributeError:
             pass
         return data
@@ -1485,13 +1642,10 @@ class Records(object):
     @DHCID.setter
     def DHCID(self, DHCID):
         if isinstance(DHCID, Record):
-            if not hasattr(self, "__DHCID"):
-                logging.debug("Creating record holder for DHCID")
-                self.__DHCID = RecordHolder()
-            if not hasattr(DHCID, "name"):
-                raise DomainRecordsError(DHCID,'The DHCID domain record has no name')
-            logging.debug("Storing %s in DHCID", DHCID.name)
-            setattr(self.__DHCID,DHCID.name,DHCID)
+            if hasattr(self, "__DHCID"):
+                logging.debug("Overwriting current record for DHCID")
+            logging.debug("Storing '%s' in DHCID", DHCID.name)
+            self.__DHCID = DHCID
         else:
             raise DomainRecordsError(DHCID,'The DHCID domain record must be of Record class')
 
@@ -1499,9 +1653,7 @@ class Records(object):
     def DLV(self):
         data = []
         try:
-            items = self.__DLV.__dict__.items()
-            for name, record in items:
-                data.append(record)
+            data = self.__DLV
         except AttributeError:
             pass
         return data
@@ -1509,13 +1661,10 @@ class Records(object):
     @DLV.setter
     def DLV(self, DLV):
         if isinstance(DLV, Record):
-            if not hasattr(self, "__DLV"):
-                logging.debug("Creating record holder for DLV")
-                self.__DLV = RecordHolder()
-            if not hasattr(DLV, "name"):
-                raise DomainRecordsError(DLV,'The DLV domain record has no name')
-            logging.debug("Storing %s in DLV", DLV.name)
-            setattr(self.__DLV,DLV.name,DLV)
+            if hasattr(self, "__DLV"):
+                logging.debug("Overwriting current record for DLV")
+            logging.debug("Storing '%s' in DLV", DLV.name)
+            self.__DLV = DLV
         else:
             raise DomainRecordsError(DLV,'The DLV domain record must be of Record class')
 
@@ -1523,9 +1672,7 @@ class Records(object):
     def DNAME(self):
         data = []
         try:
-            items = self.__DNAME.__dict__.items()
-            for name, record in items:
-                data.append(record)
+            data = self.__DNAME
         except AttributeError:
             pass
         return data
@@ -1533,13 +1680,10 @@ class Records(object):
     @DNAME.setter
     def DNAME(self, DNAME):
         if isinstance(DNAME, Record):
-            if not hasattr(self, "__DNAME"):
-                logging.debug("Creating record holder for DNAME")
-                self.__DNAME = RecordHolder()
-            if not hasattr(DNAME, "name"):
-                raise DomainRecordsError(DNAME,'The DNAME domain record has no name')
-            logging.debug("Storing %s in DNAME", DNAME.name)
-            setattr(self.__DNAME,DNAME.name,DNAME)
+            if hasattr(self, "__DNAME"):
+                logging.debug("Overwriting current record for DNAME")
+            logging.debug("Storing '%s' in DNAME", DNAME.name)
+            self.__DNAME = DNAME
         else:
             raise DomainRecordsError(DNAME,'The DNAME domain record must be of Record class')
 
@@ -1547,9 +1691,7 @@ class Records(object):
     def DNSKEY(self):
         data = []
         try:
-            items = self.__DNSKEY.__dict__.items()
-            for name, record in items:
-                data.append(record)
+            data = self.__DNSKEY
         except AttributeError:
             pass
         return data
@@ -1557,13 +1699,10 @@ class Records(object):
     @DNSKEY.setter
     def DNSKEY(self, DNSKEY):
         if isinstance(DNSKEY, Record):
-            if not hasattr(self, "__DNSKEY"):
-                logging.debug("Creating record holder for DNSKEY")
-                self.__DNSKEY = RecordHolder()
-            if not hasattr(DNSKEY, "name"):
-                raise DomainRecordsError(DNSKEY,'The DNSKEY domain record has no name')
-            logging.debug("Storing %s in DNSKEY", DNSKEY.name)
-            setattr(self.__DNSKEY,DNSKEY.name,DNSKEY)
+            if hasattr(self, "__DNSKEY"):
+                logging.debug("Overwriting current record for DNSKEY")
+            logging.debug("Storing '%s' in DNSKEY", DNSKEY.name)
+            self.__DNSKEY = DNSKEY
         else:
             raise DomainRecordsError(DNSKEY,'The DNSKEY domain record must be of Record class')
 
@@ -1571,9 +1710,7 @@ class Records(object):
     def DS(self):
         data = []
         try:
-            items = self.__DS.__dict__.items()
-            for name, record in items:
-                data.append(record)
+            data = self.__DS
         except AttributeError:
             pass
         return data
@@ -1581,13 +1718,10 @@ class Records(object):
     @DS.setter
     def DS(self, DS):
         if isinstance(DS, Record):
-            if not hasattr(self, "__DS"):
-                logging.debug("Creating record holder for DS")
-                self.__DS = RecordHolder()
-            if not hasattr(DS, "name"):
-                raise DomainRecordsError(DS,'The DS domain record has no name')
-            logging.debug("Storing %s in DS", DS.name)
-            setattr(self.__DS,DS.name,DS)
+            if hasattr(self, "__DS"):
+                logging.debug("Overwriting current record for DS")
+            logging.debug("Storing '%s' in DS", DS.name)
+            self.__DS = DS
         else:
             raise DomainRecordsError(DS,'The DS domain record must be of Record class')
 
@@ -1595,9 +1729,7 @@ class Records(object):
     def EUI(self):
         data = []
         try:
-            items = self.__EUI.__dict__.items()
-            for name, record in items:
-                data.append(record)
+            data = self.__EUI
         except AttributeError:
             pass
         return data
@@ -1605,13 +1737,10 @@ class Records(object):
     @EUI.setter
     def EUI(self, EUI):
         if isinstance(EUI, Record):
-            if not hasattr(self, "__EUI"):
-                logging.debug("Creating record holder for EUI")
-                self.__EUI = RecordHolder()
-            if not hasattr(EUI, "name"):
-                raise DomainRecordsError(EUI,'The EUI domain record has no name')
-            logging.debug("Storing %s in EUI", EUI.name)
-            setattr(self.__EUI,EUI.name,EUI)
+            if hasattr(self, "__EUI"):
+                logging.debug("Overwriting current record for EUI")
+            logging.debug("Storing '%s' in EUI", EUI.name)
+            self.__EUI = EUI
         else:
             raise DomainRecordsError(EUI,'The EUI domain record must be of Record class')
 
@@ -1619,9 +1748,7 @@ class Records(object):
     def HINFO(self):
         data = []
         try:
-            items = self.__HINFO.__dict__.items()
-            for name, record in items:
-                data.append(record)
+            data = self.__HINFO
         except AttributeError:
             pass
         return data
@@ -1629,13 +1756,10 @@ class Records(object):
     @HINFO.setter
     def HINFO(self, HINFO):
         if isinstance(HINFO, Record):
-            if not hasattr(self, "__HINFO"):
-                logging.debug("Creating record holder for HINFO")
-                self.__HINFO = RecordHolder()
-            if not hasattr(HINFO, "name"):
-                raise DomainRecordsError(HINFO,'The HINFO domain record has no name')
-            logging.debug("Storing %s in HINFO", HINFO.name)
-            setattr(self.__HINFO,HINFO.name,HINFO)
+            if hasattr(self, "__HINFO"):
+                logging.debug("Overwriting current record for HINFO")
+            logging.debug("Storing '%s' in HINFO", HINFO.name)
+            self.__HINFO = HINFO
         else:
             raise DomainRecordsError(HINFO,'The HINFO domain record must be of Record class')
 
@@ -1643,9 +1767,7 @@ class Records(object):
     def HIP(self):
         data = []
         try:
-            items = self.__HIP.__dict__.items()
-            for name, record in items:
-                data.append(record)
+            data = self.__HIP
         except AttributeError:
             pass
         return data
@@ -1653,13 +1775,10 @@ class Records(object):
     @HIP.setter
     def HIP(self, HIP):
         if isinstance(HIP, Record):
-            if not hasattr(self, "__HIP"):
-                logging.debug("Creating record holder for HIP")
-                self.__HIP = RecordHolder()
-            if not hasattr(HIP, "name"):
-                raise DomainRecordsError(HIP,'The HIP domain record has no name')
-            logging.debug("Storing %s in HIP", HIP.name)
-            setattr(self.__HIP,HIP.name,HIP)
+            if hasattr(self, "__HIP"):
+                logging.debug("Overwriting current record for HIP")
+            logging.debug("Storing '%s' in HIP", HIP.name)
+            self.__HIP = HIP
         else:
             raise DomainRecordsError(HIP,'The HIP domain record must be of Record class')
 
@@ -1667,9 +1786,7 @@ class Records(object):
     def IPSECKEY(self):
         data = []
         try:
-            items = self.__IPSECKEY.__dict__.items()
-            for name, record in items:
-                data.append(record)
+            data = self.__IPSECKEY
         except AttributeError:
             pass
         return data
@@ -1677,13 +1794,10 @@ class Records(object):
     @IPSECKEY.setter
     def IPSECKEY(self, IPSECKEY):
         if isinstance(IPSECKEY, Record):
-            if not hasattr(self, "__IPSECKEY"):
-                logging.debug("Creating record holder for IPSECKEY")
-                self.__IPSECKEY = RecordHolder()
-            if not hasattr(IPSECKEY, "name"):
-                raise DomainRecordsError(IPSECKEY,'The IPSECKEY domain record has no name')
-            logging.debug("Storing %s in IPSECKEY", IPSECKEY.name)
-            setattr(self.__IPSECKEY,IPSECKEY.name,IPSECKEY)
+            if hasattr(self, "__IPSECKEY"):
+                logging.debug("Overwriting current record for IPSECKEY")
+            logging.debug("Storing '%s' in IPSECKEY", IPSECKEY.name)
+            self.__IPSECKEY = IPSECKEY
         else:
             raise DomainRecordsError(IPSECKEY,'The IPSECKEY domain record must be of Record class')
 
@@ -1691,9 +1805,7 @@ class Records(object):
     def KEY(self):
         data = []
         try:
-            items = self.__KEY.__dict__.items()
-            for name, record in items:
-                data.append(record)
+            data = self.__KEY
         except AttributeError:
             pass
         return data
@@ -1701,13 +1813,10 @@ class Records(object):
     @KEY.setter
     def KEY(self, KEY):
         if isinstance(KEY, Record):
-            if not hasattr(self, "__KEY"):
-                logging.debug("Creating record holder for KEY")
-                self.__KEY = RecordHolder()
-            if not hasattr(KEY, "name"):
-                raise DomainRecordsError(KEY,'The KEY domain record has no name')
-            logging.debug("Storing %s in KEY", KEY.name)
-            setattr(self.__KEY,KEY.name,KEY)
+            if hasattr(self, "__KEY"):
+                logging.debug("Overwriting current record for KEY")
+            logging.debug("Storing '%s' in KEY", KEY.name)
+            self.__KEY = KEY
         else:
             raise DomainRecordsError(KEY,'The KEY domain record must be of Record class')
 
@@ -1715,9 +1824,7 @@ class Records(object):
     def KX(self):
         data = []
         try:
-            items = self.__KX.__dict__.items()
-            for name, record in items:
-                data.append(record)
+            data = self.__KX
         except AttributeError:
             pass
         return data
@@ -1725,13 +1832,10 @@ class Records(object):
     @KX.setter
     def KX(self, KX):
         if isinstance(KX, Record):
-            if not hasattr(self, "__KX"):
-                logging.debug("Creating record holder for KX")
-                self.__KX = RecordHolder()
-            if not hasattr(KX, "name"):
-                raise DomainRecordsError(KX,'The KX domain record has no name')
-            logging.debug("Storing %s in KX", KX.name)
-            setattr(self.__KX,KX.name,KX)
+            if hasattr(self, "__KX"):
+                logging.debug("Overwriting current record for KX")
+            logging.debug("Storing '%s' in KX", KX.name)
+            self.__KX = KX
         else:
             raise DomainRecordsError(KX,'The KX domain record must be of Record class')
 
@@ -1739,9 +1843,7 @@ class Records(object):
     def LOC(self):
         data = []
         try:
-            items = self.__LOC.__dict__.items()
-            for name, record in items:
-                data.append(record)
+            data = self.__LOC
         except AttributeError:
             pass
         return data
@@ -1749,13 +1851,10 @@ class Records(object):
     @LOC.setter
     def LOC(self, LOC):
         if isinstance(LOC, Record):
-            if not hasattr(self, "__LOC"):
-                logging.debug("Creating record holder for LOC")
-                self.__LOC = RecordHolder()
-            if not hasattr(LOC, "name"):
-                raise DomainRecordsError(LOC,'The LOC domain record has no name')
-            logging.debug("Storing %s in LOC", LOC.name)
-            setattr(self.__LOC,LOC.name,LOC)
+            if hasattr(self, "__LOC"):
+                logging.debug("Overwriting current record for LOC")
+            logging.debug("Storing '%s' in LOC", LOC.name)
+            self.__LOC = LOC
         else:
             raise DomainRecordsError(LOC,'The LOC domain record must be of Record class')
 
@@ -1763,9 +1862,7 @@ class Records(object):
     def MX(self):
         data = []
         try:
-            items = self.__MX.__dict__.items()
-            for name, record in items:
-                data.append(record)
+            data = self.__MX
         except AttributeError:
             pass
         return data
@@ -1773,13 +1870,10 @@ class Records(object):
     @MX.setter
     def MX(self, MX):
         if isinstance(MX, Record):
-            if not hasattr(self, "__MX"):
-                logging.debug("Creating record holder for MX")
-                self.__MX = RecordHolder()
-            if not hasattr(MX, "name"):
-                raise DomainRecordsError(MX,'The MX domain record has no name')
-            logging.debug("Storing %s in MX", MX.name)
-            setattr(self.__MX,MX.name,MX)
+            if hasattr(self, "__MX"):
+                logging.debug("Overwriting current record for MX")
+            logging.debug("Storing '%s' in MX", MX.name)
+            self.__MX = MX
         else:
             raise DomainRecordsError(MX,'The MX domain record must be of Record class')
 
@@ -1787,9 +1881,7 @@ class Records(object):
     def NAPTR(self):
         data = []
         try:
-            items = self.__NAPTR.__dict__.items()
-            for name, record in items:
-                data.append(record)
+            data = self.__NAPTR
         except AttributeError:
             pass
         return data
@@ -1797,13 +1889,10 @@ class Records(object):
     @NAPTR.setter
     def NAPTR(self, NAPTR):
         if isinstance(NAPTR, Record):
-            if not hasattr(self, "__NAPTR"):
-                logging.debug("Creating record holder for NAPTR")
-                self.__NAPTR = RecordHolder()
-            if not hasattr(NAPTR, "name"):
-                raise DomainRecordsError(NAPTR,'The NAPTR domain record has no name')
-            logging.debug("Storing %s in NAPTR", NAPTR.name)
-            setattr(self.__NAPTR,NAPTR.name,NAPTR)
+            if hasattr(self, "__NAPTR"):
+                logging.debug("Overwriting current record for NAPTR")
+            logging.debug("Storing '%s' in NAPTR", NAPTR.name)
+            self.__NAPTR = NAPTR
         else:
             raise DomainRecordsError(NAPTR,'The NAPTR domain record must be of Record class')
 
@@ -1811,9 +1900,7 @@ class Records(object):
     def NS(self):
         data = []
         try:
-            items = self.__NS.__dict__.items()
-            for name, record in items:
-                data.append(record)
+            data = self.__NS
         except AttributeError:
             pass
         return data
@@ -1821,13 +1908,10 @@ class Records(object):
     @NS.setter
     def NS(self, NS):
         if isinstance(NS, Record):
-            if not hasattr(self, "__NS"):
-                logging.debug("Creating record holder for NS")
-                self.__NS = RecordHolder()
-            if not hasattr(NS, "name"):
-                raise DomainRecordsError(NS,'The NS domain record has no name')
-            logging.debug("Storing %s in NS", NS.name)
-            setattr(self.__NS,NS.name,NS)
+            if hasattr(self, "__NS"):
+                logging.debug("Overwriting current record for NS")
+            logging.debug("Storing '%s' in NS", NS.name)
+            self.__NS = NS
         else:
             raise DomainRecordsError(NS,'The NS domain record must be of Record class')
 
@@ -1835,9 +1919,7 @@ class Records(object):
     def NSEC(self):
         data = []
         try:
-            items = self.__NSEC.__dict__.items()
-            for name, record in items:
-                data.append(record)
+            data = self.__NSEC
         except AttributeError:
             pass
         return data
@@ -1845,13 +1927,10 @@ class Records(object):
     @NSEC.setter
     def NSEC(self, NSEC):
         if isinstance(NSEC, Record):
-            if not hasattr(self, "__NSEC"):
-                logging.debug("Creating record holder for NSEC")
-                self.__NSEC = RecordHolder()
-            if not hasattr(NSEC, "name"):
-                raise DomainRecordsError(NSEC,'The NSEC domain record has no name')
-            logging.debug("Storing %s in NSEC", NSEC.name)
-            setattr(self.__NSEC,NSEC.name,NSEC)
+            if hasattr(self, "__NSEC"):
+                logging.debug("Overwriting current record for NSEC")
+            logging.debug("Storing '%s' in NSEC", NSEC.name)
+            self.__NSEC = NSEC
         else:
             raise DomainRecordsError(NSEC,'The NSEC domain record must be of Record class')
 
@@ -1859,9 +1938,7 @@ class Records(object):
     def OPENPGPKEY(self):
         data = []
         try:
-            items = self.__OPENPGPKEY.__dict__.items()
-            for name, record in items:
-                data.append(record)
+            data = self.__OPENPGPKEY
         except AttributeError:
             pass
         return data
@@ -1869,13 +1946,10 @@ class Records(object):
     @OPENPGPKEY.setter
     def OPENPGPKEY(self, OPENPGPKEY):
         if isinstance(OPENPGPKEY, Record):
-            if not hasattr(self, "__OPENPGPKEY"):
-                logging.debug("Creating record holder for OPENPGPKEY")
-                self.__OPENPGPKEY = RecordHolder()
-            if not hasattr(OPENPGPKEY, "name"):
-                raise DomainRecordsError(OPENPGPKEY,'The OPENPGPKEY domain record has no name')
-            logging.debug("Storing %s in OPENPGPKEY", OPENPGPKEY.name)
-            setattr(self.__OPENPGPKEY,OPENPGPKEY.name,OPENPGPKEY)
+            if hasattr(self, "__OPENPGPKEY"):
+                logging.debug("Overwriting current record for OPENPGPKEY")
+            logging.debug("Storing '%s' in OPENPGPKEY", OPENPGPKEY.name)
+            self.__OPENPGPKEY = OPENPGPKEY
         else:
             raise DomainRecordsError(OPENPGPKEY,'The OPENPGPKEY domain record must be of Record class')
 
@@ -1883,9 +1957,7 @@ class Records(object):
     def PTR(self):
         data = []
         try:
-            items = self.__PTR.__dict__.items()
-            for name, record in items:
-                data.append(record)
+            data = self.__PTR
         except AttributeError:
             pass
         return data
@@ -1893,13 +1965,10 @@ class Records(object):
     @PTR.setter
     def PTR(self, PTR):
         if isinstance(PTR, Record):
-            if not hasattr(self, "__PTR"):
-                logging.debug("Creating record holder for PTR")
-                self.__PTR = RecordHolder()
-            if not hasattr(PTR, "name"):
-                raise DomainRecordsError(PTR,'The PTR domain record has no name')
-            logging.debug("Storing %s in PTR", PTR.name)
-            setattr(self.__PTR,PTR.name,PTR)
+            if hasattr(self, "__PTR"):
+                logging.debug("Overwriting current record for PTR")
+            logging.debug("Storing '%s' in PTR", PTR.name)
+            self.__PTR = PTR
         else:
             raise DomainRecordsError(PTR,'The PTR domain record must be of Record class')
 
@@ -1907,9 +1976,7 @@ class Records(object):
     def RRSIG(self):
         data = []
         try:
-            items = self.__RRSIG.__dict__.items()
-            for name, record in items:
-                data.append(record)
+            data = self.__RRSIG
         except AttributeError:
             pass
         return data
@@ -1917,13 +1984,10 @@ class Records(object):
     @RRSIG.setter
     def RRSIG(self, RRSIG):
         if isinstance(RRSIG, Record):
-            if not hasattr(self, "__RRSIG"):
-                logging.debug("Creating record holder for RRSIG")
-                self.__RRSIG = RecordHolder()
-            if not hasattr(RRSIG, "name"):
-                raise DomainRecordsError(RRSIG,'The RRSIG domain record has no name')
-            logging.debug("Storing %s in RRSIG", RRSIG.name)
-            setattr(self.__RRSIG,RRSIG.name,RRSIG)
+            if hasattr(self, "__RRSIG"):
+                logging.debug("Overwriting current record for RRSIG")
+            logging.debug("Storing '%s' in RRSIG", RRSIG.name)
+            self.__RRSIG = RRSIG
         else:
             raise DomainRecordsError(RRSIG,'The RRSIG domain record must be of Record class')
 
@@ -1931,9 +1995,7 @@ class Records(object):
     def RP(self):
         data = []
         try:
-            items = self.__RP.__dict__.items()
-            for name, record in items:
-                data.append(record)
+            data = self.__RP
         except AttributeError:
             pass
         return data
@@ -1941,13 +2003,10 @@ class Records(object):
     @RP.setter
     def RP(self, RP):
         if isinstance(RP, Record):
-            if not hasattr(self, "__RP"):
-                logging.debug("Creating record holder for RP")
-                self.__RP = RecordHolder()
-            if not hasattr(RP, "name"):
-                raise DomainRecordsError(RP,'The RP domain record has no name')
-            logging.debug("Storing %s in RP", RP.name)
-            setattr(self.__RP,RP.name,RP)
+            if hasattr(self, "__RP"):
+                logging.debug("Overwriting current record for RP")
+            logging.debug("Storing '%s' in RP", RP.name)
+            self.__RP = RP
         else:
             raise DomainRecordsError(RP,'The RP domain record must be of Record class')
 
@@ -1955,9 +2014,7 @@ class Records(object):
     def SIG(self):
         data = []
         try:
-            items = self.__SIG.__dict__.items()
-            for name, record in items:
-                data.append(record)
+            data = self.__SIG
         except AttributeError:
             pass
         return data
@@ -1965,13 +2022,10 @@ class Records(object):
     @SIG.setter
     def SIG(self, SIG):
         if isinstance(SIG, Record):
-            if not hasattr(self, "__SIG"):
-                logging.debug("Creating record holder for SIG")
-                self.__SIG = RecordHolder()
-            if not hasattr(SIG, "name"):
-                raise DomainRecordsError(SIG,'The SIG domain record has no name')
-            logging.debug("Storing %s in SIG", SIG.name)
-            setattr(self.__SIG,SIG.name,SIG)
+            if hasattr(self, "__SIG"):
+                logging.debug("Overwriting current record for SIG")
+            logging.debug("Storing '%s' in SIG", SIG.name)
+            self.__SIG = SIG
         else:
             raise DomainRecordsError(SIG,'The SIG domain record must be of Record class')
 
@@ -1979,9 +2033,7 @@ class Records(object):
     def SMIMEA(self):
         data = []
         try:
-            items = self.__SMIMEA.__dict__.items()
-            for name, record in items:
-                data.append(record)
+            data = self.__SMIMEA
         except AttributeError:
             pass
         return data
@@ -1989,13 +2041,10 @@ class Records(object):
     @SMIMEA.setter
     def SMIMEA(self, SMIMEA):
         if isinstance(SMIMEA, Record):
-            if not hasattr(self, "__SMIMEA"):
-                logging.debug("Creating record holder for SMIMEA")
-                self.__SMIMEA = RecordHolder()
-            if not hasattr(SMIMEA, "name"):
-                raise DomainRecordsError(SMIMEA,'The SMIMEA domain record has no name')
-            logging.debug("Storing %s in SMIMEA", SMIMEA.name)
-            setattr(self.__SMIMEA,SMIMEA.name,SMIMEA)
+            if hasattr(self, "__SMIMEA"):
+                logging.debug("Overwriting current record for SMIMEA")
+            logging.debug("Storing '%s' in SMIMEA", SMIMEA.name)
+            self.__SMIMEA = SMIMEA
         else:
             raise DomainRecordsError(SMIMEA,'The SMIMEA domain record must be of Record class')
 
@@ -2003,9 +2052,7 @@ class Records(object):
     def SOA(self):
         data = []
         try:
-            items = self.__SOA.__dict__.items()
-            for name, record in items:
-                data.append(record)
+            data = self.__SOA
         except AttributeError:
             pass
         return data
@@ -2013,13 +2060,10 @@ class Records(object):
     @SOA.setter
     def SOA(self, SOA):
         if isinstance(SOA, Record):
-            if not hasattr(self, "__SOA"):
-                logging.debug("Creating record holder for SOA")
-                self.__SOA = RecordHolder()
-            if not hasattr(SOA, "name"):
-                raise DomainRecordsError(SOA,'The SOA domain record has no name')
-            logging.debug("Storing %s in SOA", SOA.name)
-            setattr(self.__SOA,SOA.name,SOA)
+            if hasattr(self, "__SOA"):
+                logging.debug("Overwriting current record for SOA")
+            logging.debug("Storing '%s' in SOA", SOA.name)
+            self.__SOA = SOA
         else:
             raise DomainRecordsError(SOA,'The SOA domain record must be of Record class')
 
@@ -2027,9 +2071,7 @@ class Records(object):
     def SRV(self):
         data = []
         try:
-            items = self.__SRV.__dict__.items()
-            for name, record in items:
-                data.append(record)
+            data = self.__SRV
         except AttributeError:
             pass
         return data
@@ -2037,13 +2079,10 @@ class Records(object):
     @SRV.setter
     def SRV(self, SRV):
         if isinstance(SRV, Record):
-            if not hasattr(self, "__SRV"):
-                logging.debug("Creating record holder for SRV")
-                self.__SRV = RecordHolder()
-            if not hasattr(SRV, "name"):
-                raise DomainRecordsError(SRV,'The SRV domain record has no name')
-            logging.debug("Storing %s in SRV", SRV.name)
-            setattr(self.__SRV,SRV.name,SRV)
+            if hasattr(self, "__SRV"):
+                logging.debug("Overwriting current record for SRV")
+            logging.debug("Storing '%s' in SRV", SRV.name)
+            self.__SRV = SRV
         else:
             raise DomainRecordsError(SRV,'The SRV domain record must be of Record class')
 
@@ -2051,9 +2090,7 @@ class Records(object):
     def SSHFP(self):
         data = []
         try:
-            items = self.__SSHFP.__dict__.items()
-            for name, record in items:
-                data.append(record)
+            data = self.__SSHFP
         except AttributeError:
             pass
         return data
@@ -2061,13 +2098,10 @@ class Records(object):
     @SSHFP.setter
     def SSHFP(self, SSHFP):
         if isinstance(SSHFP, Record):
-            if not hasattr(self, "__SSHFP"):
-                logging.debug("Creating record holder for SSHFP")
-                self.__SSHFP = RecordHolder()
-            if not hasattr(SSHFP, "name"):
-                raise DomainRecordsError(SSHFP,'The SSHFP domain record has no name')
-            logging.debug("Storing %s in SSHFP", SSHFP.name)
-            setattr(self.__SSHFP,SSHFP.name,SSHFP)
+            if hasattr(self, "__SSHFP"):
+                logging.debug("Overwriting current record for SSHFP")
+            logging.debug("Storing '%s' in SSHFP", SSHFP.name)
+            self.__SSHFP = SSHFP
         else:
             raise DomainRecordsError(SSHFP,'The SSHFP domain record must be of Record class')
 
@@ -2075,9 +2109,7 @@ class Records(object):
     def TA(self):
         data = []
         try:
-            items = self.__TA.__dict__.items()
-            for name, record in items:
-                data.append(record)
+            data = self.__TA
         except AttributeError:
             pass
         return data
@@ -2085,13 +2117,10 @@ class Records(object):
     @TA.setter
     def TA(self, TA):
         if isinstance(TA, Record):
-            if not hasattr(self, "__TA"):
-                logging.debug("Creating record holder for TA")
-                self.__TA = RecordHolder()
-            if not hasattr(TA, "name"):
-                raise DomainRecordsError(TA,'The TA domain record has no name')
-            logging.debug("Storing %s in TA", TA.name)
-            setattr(self.__TA,TA.name,TA)
+            if hasattr(self, "__TA"):
+                logging.debug("Overwriting current record for TA")
+            logging.debug("Storing '%s' in TA", TA.name)
+            self.__TA = TA
         else:
             raise DomainRecordsError(TA,'The TA domain record must be of Record class')
 
@@ -2099,9 +2128,7 @@ class Records(object):
     def TKEY(self):
         data = []
         try:
-            items = self.__TKEY.__dict__.items()
-            for name, record in items:
-                data.append(record)
+            data = self.__TKEY
         except AttributeError:
             pass
         return data
@@ -2109,13 +2136,10 @@ class Records(object):
     @TKEY.setter
     def TKEY(self, TKEY):
         if isinstance(TKEY, Record):
-            if not hasattr(self, "__TKEY"):
-                logging.debug("Creating record holder for TKEY")
-                self.__TKEY = RecordHolder()
-            if not hasattr(TKEY, "name"):
-                raise DomainRecordsError(TKEY,'The TKEY domain record has no name')
-            logging.debug("Storing %s in TKEY", TKEY.name)
-            setattr(self.__TKEY,TKEY.name,TKEY)
+            if hasattr(self, "__TKEY"):
+                logging.debug("Overwriting current record for TKEY")
+            logging.debug("Storing '%s' in TKEY", TKEY.name)
+            self.__TKEY = TKEY
         else:
             raise DomainRecordsError(TKEY,'The TKEY domain record must be of Record class')
 
@@ -2123,9 +2147,7 @@ class Records(object):
     def TLSA(self):
         data = []
         try:
-            items = self.__TLSA.__dict__.items()
-            for name, record in items:
-                data.append(record)
+            data = self.__TLSA
         except AttributeError:
             pass
         return data
@@ -2133,13 +2155,10 @@ class Records(object):
     @TLSA.setter
     def TLSA(self, TLSA):
         if isinstance(TLSA, Record):
-            if not hasattr(self, "__TLSA"):
-                logging.debug("Creating record holder for TLSA")
-                self.__TLSA = RecordHolder()
-            if not hasattr(TLSA, "name"):
-                raise DomainRecordsError(TLSA,'The TLSA domain record has no name')
-            logging.debug("Storing %s in TLSA", TLSA.name)
-            setattr(self.__TLSA,TLSA.name,TLSA)
+            if hasattr(self, "__TLSA"):
+                logging.debug("Overwriting current record for TLSA")
+            logging.debug("Storing '%s' in TLSA", TLSA.name)
+            self.__TLSA = TLSA
         else:
             raise DomainRecordsError(TLSA,'The TLSA domain record must be of Record class')
 
@@ -2147,9 +2166,7 @@ class Records(object):
     def TSIG(self):
         data = []
         try:
-            items = self.__TSIG.__dict__.items()
-            for name, record in items:
-                data.append(record)
+            data = self.__TSIG
         except AttributeError:
             pass
         return data
@@ -2157,13 +2174,10 @@ class Records(object):
     @TSIG.setter
     def TSIG(self, TSIG):
         if isinstance(TSIG, Record):
-            if not hasattr(self, "__TSIG"):
-                logging.debug("Creating record holder for TSIG")
-                self.__TSIG = RecordHolder()
-            if not hasattr(TSIG, "name"):
-                raise DomainRecordsError(TSIG,'The TSIG domain record has no name')
-            logging.debug("Storing %s in TSIG", TSIG.name)
-            setattr(self.__TSIG,TSIG.name,TSIG)
+            if hasattr(self, "__TSIG"):
+                logging.debug("Overwriting current record for TSIG")
+            logging.debug("Storing '%s' in TSIG", TSIG.name)
+            self.__TSIG = TSIG
         else:
             raise DomainRecordsError(TSIG,'The TSIG domain record must be of Record class')
 
@@ -2171,9 +2185,7 @@ class Records(object):
     def TXT(self):
         data = []
         try:
-            items = self.__TXT.__dict__.items()
-            for name, record in items:
-                data.append(record)
+            data = self.__TXT
         except AttributeError:
             pass
         return data
@@ -2181,13 +2193,10 @@ class Records(object):
     @TXT.setter
     def TXT(self, TXT):
         if isinstance(TXT, Record):
-            if not hasattr(self, "__TXT"):
-                logging.debug("Creating record holder for TXT")
-                self.__TXT = RecordHolder()
-            if not hasattr(TXT, "name"):
-                raise DomainRecordsError(TXT,'The TXT domain record has no name')
-            logging.debug("Storing %s in TXT", TXT.name)
-            setattr(self.__TXT,TXT.name,TXT)
+            if hasattr(self, "__TXT"):
+                logging.debug("Overwriting current record for TXT")
+            logging.debug("Storing '%s' in TXT", TXT.name)
+            self.__TXT = TXT
         else:
             raise DomainRecordsError(TXT,'The TXT domain record must be of Record class')
 
@@ -2195,9 +2204,7 @@ class Records(object):
     def URI(self):
         data = []
         try:
-            items = self.__URI.__dict__.items()
-            for name, record in items:
-                data.append(record)
+            data = self.__URI
         except AttributeError:
             pass
         return data
@@ -2205,13 +2212,10 @@ class Records(object):
     @URI.setter
     def URI(self, URI):
         if isinstance(URI, Record):
-            if not hasattr(self, "__URI"):
-                logging.debug("Creating record holder for URI")
-                self.__URI = RecordHolder()
-            if not hasattr(URI, "name"):
-                raise DomainRecordsError(URI,'The URI domain record has no name')
-            logging.debug("Storing %s in URI", URI.name)
-            setattr(self.__URI,URI.name,URI)
+            if hasattr(self, "__URI"):
+                logging.debug("Overwriting current record for URI")
+            logging.debug("Storing '%s' in URI", URI.name)
+            self.__URI = URI
         else:
             raise DomainRecordsError(URI,'The URI domain record must be of Record class')
 
@@ -2219,9 +2223,7 @@ class Records(object):
     def ZONEMD(self):
         data = []
         try:
-            items = self.__ZONEMD.__dict__.items()
-            for name, record in items:
-                data.append(record)
+            data = self.__ZONEMD
         except AttributeError:
             pass
         return data
@@ -2229,13 +2231,10 @@ class Records(object):
     @ZONEMD.setter
     def ZONEMD(self, ZONEMD):
         if isinstance(ZONEMD, Record):
-            if not hasattr(self, "__ZONEMD"):
-                logging.debug("Creating record holder for ZONEMD")
-                self.__ZONEMD = RecordHolder()
-            if not hasattr(ZONEMD, "name"):
-                raise DomainRecordsError(ZONEMD,'The ZONEMD domain record has no name')
-            logging.debug("Storing %s in ZONEMD", ZONEMD.name)
-            setattr(self.__ZONEMD,ZONEMD.name,ZONEMD)
+            if hasattr(self, "__ZONEMD"):
+                logging.debug("Overwriting current record for ZONEMD")
+            logging.debug("Storing '%s' in ZONEMD", ZONEMD.name)
+            self.__ZONEMD = ZONEMD
         else:
             raise DomainRecordsError(ZONEMD,'The ZONEMD domain record must be of Record class')
 
@@ -2256,8 +2255,6 @@ class Records(object):
     def __str__(self):
         data = {}
         for record_type in self.__record_types:
-            if hasattr(self, f'__{record_type}'):
-                data[record_type] = getattr(self, f'__{record_type}')
-            else:
-                data[record_type] = None
+            record_attribute = f'_Records__{record_type}'
+            data[record_type]= str(getattr(self,record_attribute, None))
         return str(data)

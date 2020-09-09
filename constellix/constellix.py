@@ -8,31 +8,45 @@ import os
 import requests
 import base64
 import urllib.parse
+import time
 
 import util
 
-_CONSTELLIX_APISECRET = os.environ['CONSTELLIX_APISECRET']
+_CONSTELLIX_APISECRET = None
 """string: The Constellix API secret
 
 Generated in the Constellix dashboard.
 """
+if 'CONSTELLIX_APISECRET' in os.environ: _CONSTELLIX_APISECRET = os.environ['CONSTELLIX_APISECRET']
 
-_CONSTELLIX_APIKEY = os.environ['CONSTELLIX_APIKEY']
+_CONSTELLIX_APIKEY = None
 """string: The Constellix API key
 
 Generated in the Constellix dashboard.
 """
+if 'CONSTELLIX_APIKEY' in os.environ: _CONSTELLIX_APIKEY = os.environ['CONSTELLIX_APIKEY']
 
 _DEFAULT_HOST = "api.dns.constellix.com"
 _DEFAULT_VERSION = "v1"
 _DEFAULT_SERVICE = "domains"
-_DEFAULT_TRIES = 8
+_DEFAULT_TRIES = 20
 
 _CACHE_GET = {}
 
 class Error(Exception):
     """Base class for exceptions in this module."""
     pass
+
+class MissingKeySecretError(Error):
+    """Exception raised if the key or secret is missing for the Constellix API
+
+    Attributes:
+        message (str): explanation of the error
+    """
+
+    def __init__(self, message):
+        super().__init__()
+        self.message = message
 
 class ConstellixAPIError(Error):
     """Exception raised for errors with the Constellix API.
@@ -64,6 +78,8 @@ class ConstellixAuthentication():
 
     def __init__(self, key, secret):
         super().__init__()
+        if not (key and secret):
+            raise MissingKeySecretError("The Constellix API Key and Secret must be provided.")
         self.key = key
         self.secret = secret
 
@@ -77,6 +93,7 @@ class api():
         self.__tries = tries
         self.__verbosity = verbosity
         self.__auth = ConstellixAuthentication(key, secret)
+        self.__session = requests.Session()
 
         if self.__verbosity > 3:
             log_level = logging.DEBUG
@@ -134,14 +151,18 @@ class api():
             direction = "to"
         elif method == "DELETE" and data:
             payload = data
-        elif data:
-            url += '?' + urllib.parse.urlencode(data)
+        elif method == "GET":
             if use_get_cache: cache = True
+            if data:
+                url += '?' + urllib.parse.urlencode(data)
             if use_get_cache and url in _CACHE_GET:
                 logging.info('[CACHE/%s] %s', method, url)
                 return _CACHE_GET[url]["json"]
+        elif data:
+            payload = data
 
         logging.info('[%s] %s', method, url)
+        if payload: logging.debug("Payload: %s", payload)
 
         attempt = 1
         while attempt <= self.__tries:
@@ -150,7 +171,7 @@ class api():
                 'Content-Type': 'application/json',
                 'x-cns-security-token': token
             }
-            response = requests.request(method, url, headers=headers, json = payload)
+            response = self.__session.request(method, url, headers=headers, json = payload)
             failures.append({
                 "attempt": attempt,
                 "trace": response.headers["X-Trace"],
@@ -166,24 +187,26 @@ class api():
                 break
             
             attempt += 1
-            logging.debug('[%i] trace: %s', response.status_code,response.headers["X-Trace"])
-            logging.debug(response.text)
+            logging.debug('[%i] trace: %s. %s', response.status_code,response.headers["X-Trace"], response.text)
+
+        response_data = None
+
+        if 200 <= response.status_code <= 299:
+            response_data = response.json()
+        elif response.status_code == 404:
+            pass
+        else:
+            raise ConstellixAPIError(url, response.status_code, f'Unable to {method} data {direction} Constellix API.', response.headers["X-Trace"], token, failures)
 
         if cache:
             _CACHE_GET[url] = {
                 "status": response.status_code,
-                "json": None
+                "json": response_data,
+                "ts": time.time_ns() / (10 ** 9)
             }
+            logging.debug("[CACHED] %s = %s", url, _CACHE_GET[url])
 
-        if 200 <= response.status_code <= 299:
-            if cache: _CACHE_GET[url]["json"] = response.json()
-            return response.json()
-        elif response.status_code == 404:
-            return
-        else:
-            raise ConstellixAPIError(url, response.status_code, f'Unable to {method} data {direction} Constellix API.', response.headers["X-Trace"], token, failures)
-
-        return
+        return response_data
     
     def search(self, data = {}, domain_id = None, record_type = None, use_cache = True):
         uri = ''

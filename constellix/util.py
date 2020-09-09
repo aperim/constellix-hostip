@@ -47,4 +47,4 @@ def epoch():
         Returns:
             int: The current epoch in milliseconds
     """    
-    return int(time.time_ns()/1000000)
+    return round(time.time_ns()/1000000)
