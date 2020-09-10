@@ -110,11 +110,11 @@ def main():
     logging.info('Completed processing in %ims.',elapsed_time_ms)
     finished_text = ""
     if int(changes["added"]) > 0:
-        finished_text += f'{changes["added"]} records added. '
+        finished_text += str(changes["added"]) + ' records added. '
     if int(changes["updated"]) > 0:
-        finished_text += f'{changes["updated"]} records updated. '
+        finished_text += str(changes["updated"]) + ' records updated. '
     if int(changes["deleted"]) > 0:
-        finished_text += f'{changes["deleted"]} records deleted. '
+        finished_text += str(changes["deleted"]) + ' records deleted. '
 
     if len(finished_text) == 0:
         finished_text = 'No changes were made.'
