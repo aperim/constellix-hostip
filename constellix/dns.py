@@ -246,7 +246,7 @@ class Domain(object):
             "exists": []
         }
 
-        fqdn = self.parent_name
+        fqdn = self.parent_name + '.'
         if self.name and len(self.name)>0:
             fqdn = f'{self.name}.{fqdn}'
 
