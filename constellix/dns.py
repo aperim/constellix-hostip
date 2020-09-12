@@ -140,6 +140,7 @@ class Domain(object):
 
     def get_all_records(self, record_type = "A"):
         self.records.reset(record_type)
+        if not (hasattr(self, "name") and hasattr(self, "parent_id")): return getattr(self.records, record_type)
         records = self.__api.search(self.name, self.parent_id, record_type)
         if records and len(records) > 0:
            for record in records:
