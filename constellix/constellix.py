@@ -171,15 +171,29 @@ class api():
                 'Content-Type': 'application/json',
                 'x-cns-security-token': token
             }
+            
             response = self.__session.request(method, url, headers=headers, json = payload)
+            trace = response.headers["X-Trace"] if "X-Trace" in response.headers else 'Unknown'
+            remaining = int(response.headers["requestsRemainingHeader"]) if "requestsRemainingHeader" in response.headers else 0
+            limit = int(response.headers["requestLimitHeader"]) if "requestLimitHeader" in response.headers else 0
+            interval = int(response.headers["requestRefreshInterval"]) if "requestRefreshInterval" in response.headers else 0
+            limit_interval = float(response.headers["requestLimitInterval"]) if "requestLimitInterval" in response.headers else 0
+            limit_rate = float(response.headers["requestLimitRate"]) if "requestLimitRate" in response.headers else 0
+            
             failures.append({
                 "attempt": attempt,
-                "trace": response.headers["X-Trace"],
+                "trace": trace,
                 "token": token,
-                "status": response.status_code
+                "status": response.status_code,
+                "remaining": remaining,
+                "limit": limit,
+                "interval": interval,
+                "limit_interval": limit_interval,
+                "limit_rate": limit_rate
             })
 
             if response.status_code == 200:
+                logging.info('[%i] Requests remaining: %i of %i', response.status_code, remaining, limit)
                 break
             if response.status_code == 400:
                 break
@@ -187,7 +201,7 @@ class api():
                 break
             
             attempt += 1
-            logging.debug('[%i] trace: %s. %s', response.status_code,response.headers["X-Trace"], response.text)
+            logging.debug('[%i] trace: %s token: %s %s', response.status_code, trace, token, response.text)
 
         response_data = None
 

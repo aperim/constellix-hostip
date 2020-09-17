@@ -52,6 +52,7 @@ import logging
 import datetime
 import argparse
 import re
+import ntplib
 
 import util
 import dns
@@ -63,6 +64,14 @@ The TTL used for newly created DNS entries
 """
 
 def main():
+    c = ntplib.NTPClient()
+    # Provide the respective ntp server ip in below function
+    response = c.request('pool.ntp.org', version=3)
+    # print (response.offset)
+    # print (datetime.datetime.fromtimestamp(response.tx_time, datetime.timezone.utc))
+
+    ntp_time_offset = float(response.offset)
+    ntp_datetime = datetime.datetime.fromtimestamp(response.tx_time, datetime.timezone.utc)
     start_timestamp = datetime.datetime.now()
 
     parser = argparse.ArgumentParser()
@@ -86,6 +95,7 @@ def main():
 
     logging.basicConfig(format='%(asctime)s %(levelname)-8s %(message)s', level=log_level, datefmt='%Y-%m-%d %H:%M:%S')
 
+    logging.debug('NTP Time is %s (Offset %s)', ntp_datetime, ntp_time_offset)
     logging.info('Getting details for domain %s.', args.domain)
     
     domain = dns.Domain(args.domain,verbosity=_verbose)
@@ -124,3 +134,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
