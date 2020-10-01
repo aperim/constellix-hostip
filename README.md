@@ -28,8 +28,11 @@ python3 ./constellix/host.py --ipv4 203.0.113.1 --ipv6 2001:0db8:0000:0025:0000:
 ```
 The above would set the following records:
 `203.0.113.1 A example.com.`
+
 `2001:0db8:0000:0025:0000:0000:0000:0000 AAAA example.com.`
+
 `1.113.0.203.in-addr.arpa. PTR example.com.`
+
 `0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.5.2.0.0.0.0.0.0.8.b.d.0.1.0.0.2.ip6.arpa PTR example.com.`
 
 ## Deleting Records
