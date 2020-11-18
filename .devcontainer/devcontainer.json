@@ -30,7 +30,8 @@
 	"extensions": [
 		"ms-python.python",
 		"kiteco.kite",
-		"ms-azuretools.vscode-docker"		
+		"ms-azuretools.vscode-docker",
+		"ms-python.vscode-pylance"
 	],
 
 	"runArgs": ["--env-file","${localWorkspaceFolder}/.env"],
