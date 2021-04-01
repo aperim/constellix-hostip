@@ -9,6 +9,10 @@
 
 Set the forward and reverse DNS entries for a host with DNS services provided by Constellix. Supports IPv6 and IPv4.
 
+## Super Super Important
+
+As you will see below - this is a slow, very painful process. Constellix's API sucks. If you can use any other DNS hosting service - do it - don't waste your time here. If you are stuck with constellix (like we are) and you find this script useful - great. Please contact constellix and ask them to take their API seriously.
+
 ## Docker
 You can run this inside a docker container:
 ```bash
@@ -59,6 +63,7 @@ Forward and reverse records can only be set for domains in your account.
 This is a slow process.
 Constellix doesn't have any way to find a domain record with a simple search, so we have to look for parts of the domain until we find a match - for IPv6 records - this takes a lot of API requests.
 Further hindering the process is authentication errors with Constellix's API. Over 50% of valid API requests fail against the API with a `401` error. Once Constellix fix this - it will double the speed of these updates.
+Constellix's API now take 20+ seconds to respond to most requests. Expect updating the forward and reverse records for one domain to take well in excess of 5½ minutes.
 
 ## Examples
 
