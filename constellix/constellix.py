@@ -210,8 +210,8 @@ class api():
             try:
                 response_data = response.json()
             except JSONDecodeError as e:
-                print(response.data)
-                print(e)
+                logging.warning("Received invalid JSON in response: %s", str(response.content))
+                logging.error(e)
         elif response.status_code == 404:
             pass
         else:
