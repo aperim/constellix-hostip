@@ -416,7 +416,7 @@ class Domain(object):
 
             logging.debug("Sending changes for %i: %s",int(parent_id), str(changes))
             result = self.__api.bulk(parent_id, changes)
-            if not "success" in result:
+            if result is None or not "success" in result:
                 raise DomainUpdateError("Unable to update domain")
 
             this_added = 0
