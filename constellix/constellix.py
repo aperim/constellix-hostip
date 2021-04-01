@@ -9,6 +9,7 @@ import requests
 import base64
 import urllib.parse
 import time
+from json import JSONDecodeError
 
 import util
 
@@ -206,7 +207,11 @@ class api():
         response_data = None
 
         if 200 <= response.status_code <= 299:
-            response_data = response.json()
+            try:
+                response_data = response.json()
+            except JSONDecodeError as e:
+                print(response.data)
+                print(e)
         elif response.status_code == 404:
             pass
         else:
