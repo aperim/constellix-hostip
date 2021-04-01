@@ -9,7 +9,6 @@ import requests
 import base64
 import urllib.parse
 import time
-import types
 from json import JSONDecodeError
 
 import util
@@ -205,7 +204,7 @@ class api():
             attempt += 1
             logging.debug('[%i] trace: %s token: %s %s', response.status_code, trace, token, response.text)
 
-        response_data = types.SimpleNamespace()
+        response_data = lambda: None
 
         if 200 <= response.status_code <= 299:
             try:
