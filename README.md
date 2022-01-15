@@ -70,6 +70,7 @@ Constellix doesn't have any way to find a domain record with a simple search, so
 
 Further hindering the process is authentication errors with Constellix's API. Over 50% of valid API requests fail against the API with a `401` error. Once Constellix fix this - it will double the speed of these updates.
 Constellix's API now take 20+ seconds to respond to most requests. Expect updating the forward and reverse records for one domain to take well in excess of 5½ minutes (sometimes up to 20).
+
 *NOTE* It looks like Constellix has finally fixed the issue!
 
 ## Examples
