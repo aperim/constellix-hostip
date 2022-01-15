@@ -16,7 +16,7 @@ As you will see below - this is a slow, very painful process. Constellix's API s
 ## Docker
 You can run this inside a docker container:
 ```bash
-$ docker run --rm -it -e CONSTELLIX_APISECRET=690dfc33-e457-401e-a1c4-d4a2f1b870b7 -e CONSTELLIX_APIKEY=3a4ffdf9-71e4-4458-94b6-14fd940b81bf aperimau/constellix-hostip -vvv example.com
+$ docker run --rm -it -e CONSTELLIX_APISECRET=690dfc33-e457-401e-a1c4-d4a2f1b870b7 -e CONSTELLIX_APIKEY=3a4ffdf9-71e4-4458-94b6-14fd940b81bf ghcr.io/aperim/constellix-hostip/constellix-hostip:latest -vvv example.com
 ```
 
 ## Environment
@@ -65,8 +65,12 @@ Forward and reverse records can only be set for domains in your account.
 ## Caveats
 This is a slow process.
 Constellix doesn't have any way to find a domain record with a simple search, so we have to look for parts of the domain until we find a match - for IPv6 records - this takes a lot of API requests.
+
+### Speed
+
 Further hindering the process is authentication errors with Constellix's API. Over 50% of valid API requests fail against the API with a `401` error. Once Constellix fix this - it will double the speed of these updates.
 Constellix's API now take 20+ seconds to respond to most requests. Expect updating the forward and reverse records for one domain to take well in excess of 5½ minutes (sometimes up to 20).
+*NOTE* It looks like Constellix has finally fixed the issue!
 
 ## Examples
 
