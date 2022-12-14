@@ -41,7 +41,7 @@ Examples:
         $ python host.py demo.sydney.example.com
 
 Todo:
-    * Get Constellix to fix their API (Looks like it might finally be fixed!)
+    * Get Constellix to fix their API (Still broke Dec 2022)
 
 .. _Aperim:
    https://aperim.com/
